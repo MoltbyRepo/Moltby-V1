@@ -1,4 +1,4 @@
-# Moltby - Telegram Agent Manager
+# Moltby
 
 ## Overview
 A React + Express application for managing Telegram bot agents powered by OpenAI. Users connect a wallet, configure a Telegram bot token and chat ID, then manage their AI agent through a dashboard.
