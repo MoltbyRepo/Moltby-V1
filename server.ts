@@ -3,9 +3,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { Telegraf } from "telegraf";
-import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
 import dotenv from "dotenv";
 import cron, { ScheduledTask } from "node-cron";
+import Database from "better-sqlite3";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -141,112 +143,189 @@ async function startServer() {
     }
   });
 
-  // --- Nodes & Security System ---
+  // --- Nodes & Security System (SQLite-backed) ---
 
-  interface Device {
-    id: string;
-    name: string;
-    description: string;
-    roles: string[];
-    scopes: string[];
-    tokens: { name: string; status: string; scopes: string[]; age: string }[];
+  const db = new Database("moltby.db");
+  db.pragma("journal_mode = WAL");
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS exec_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      target_host TEXT NOT NULL DEFAULT 'Gateway',
+      scope TEXT NOT NULL DEFAULT 'Defaults',
+      security_mode TEXT NOT NULL DEFAULT 'Deny',
+      ask_mode TEXT NOT NULL DEFAULT 'On miss',
+      ask_fallback TEXT NOT NULL DEFAULT 'Deny',
+      auto_allow_clis INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO exec_config (id) VALUES (1);
+
+    CREATE TABLE IF NOT EXISTS node_binding (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      default_binding TEXT NOT NULL DEFAULT 'Any node',
+      agent_bindings TEXT NOT NULL DEFAULT '{"main":"Use default"}'
+    );
+    INSERT OR IGNORE INTO node_binding (id) VALUES (1);
+
+    CREATE TABLE IF NOT EXISTS devices (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      roles TEXT NOT NULL DEFAULT '[]',
+      scopes TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS device_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      scopes TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  function getTimeAgo(dateStr: string): string {
+    const created = new Date(dateStr + "Z");
+    const now = new Date();
+    const diffMs = now.getTime() - created.getTime();
+    const diffSecs = Math.floor(diffMs / 1000);
+    if (diffSecs < 60) return "Just now";
+    const diffMins = Math.floor(diffSecs / 60);
+    if (diffMins < 60) return `${diffMins}m ago`;
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) return `${diffHours}h ago`;
+    const diffDays = Math.floor(diffHours / 24);
+    return `${diffDays}d ago`;
   }
 
-  interface ExecConfig {
-    targetHost: string;
-    scope: string;
-    securityMode: string;
-    askMode: string;
-    askFallback: string;
-    autoAllowCLIs: boolean;
+  function getDevicesFromDb() {
+    const rows = db.prepare("SELECT * FROM devices ORDER BY created_at DESC").all() as any[];
+    return rows.map((d: any) => {
+      const tokens = db.prepare("SELECT * FROM device_tokens WHERE device_id = ?").all(d.id) as any[];
+      return {
+        id: d.id,
+        name: d.name,
+        description: d.description,
+        roles: JSON.parse(d.roles),
+        scopes: JSON.parse(d.scopes),
+        tokens: tokens.map((t: any) => ({
+          name: t.name,
+          status: t.status,
+          scopes: JSON.parse(t.scopes),
+          age: getTimeAgo(t.created_at),
+        })),
+      };
+    });
   }
 
-  interface NodeBinding {
-    defaultBinding: string;
-    agentBindings: Record<string, string>;
+  function getExecConfig() {
+    const row = db.prepare("SELECT * FROM exec_config WHERE id = 1").get() as any;
+    return {
+      targetHost: row.target_host,
+      scope: row.scope,
+      securityMode: row.security_mode,
+      askMode: row.ask_mode,
+      askFallback: row.ask_fallback,
+      autoAllowCLIs: !!row.auto_allow_clis,
+    };
   }
 
-  // Mock Data Store
-  let execConfig: ExecConfig = {
-    targetHost: "Gateway",
-    scope: "Defaults",
-    securityMode: "Deny",
-    askMode: "On miss",
-    askFallback: "Deny",
-    autoAllowCLIs: false
-  };
-
-  let nodeBinding: NodeBinding = {
-    defaultBinding: "Any node",
-    agentBindings: {
-      "main": "Use default"
-    }
-  };
-
-  let devices: Device[] = [
-    {
-      id: "c9e4584e970807cc18fe02080a550e906208429026c58c828c442b67c2cd9874",
-      name: "c9e4584e970807cc18fe02080a550e906208429026c58c828c442b67c2cd9874",
-      description: "c9e4584e970807cc18fe02080a550e906208429026c58c828c442b67c2cd9874",
-      roles: ["operator"],
-      scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
-      tokens: [
-        { name: "operator", status: "active", scopes: ["operator.admin", "operator.approvals", "operator.pairing"], age: "6d ago" }
-      ]
-    },
-    {
-      id: "openclaw-tui",
-      name: "openclaw-tui",
-      description: "fb9b64897f79697e54c05d95beaba5776c3397f591ba2fb1b7614f0bb6701e85",
-      roles: ["operator"],
-      scopes: ["operator.admin", "operator.approvals", "operator.pairing"],
-      tokens: [
-        { name: "operator", status: "active", scopes: ["operator.admin", "operator.approvals", "operator.pairing"], age: "6d ago" }
-      ]
-    }
-  ];
+  function getNodeBinding() {
+    const row = db.prepare("SELECT * FROM node_binding WHERE id = 1").get() as any;
+    return {
+      defaultBinding: row.default_binding,
+      agentBindings: JSON.parse(row.agent_bindings),
+    };
+  }
 
   // Endpoints
   app.get("/api/nodes/config", (req, res) => {
-    res.json({ execConfig, nodeBinding });
+    res.json({ execConfig: getExecConfig(), nodeBinding: getNodeBinding() });
   });
 
   app.post("/api/nodes/config/exec", (req, res) => {
-    execConfig = { ...execConfig, ...req.body };
-    res.json({ success: true, execConfig });
+    const { targetHost, scope, securityMode, askMode, askFallback, autoAllowCLIs } = req.body;
+    db.prepare(`
+      UPDATE exec_config SET
+        target_host = COALESCE(?, target_host),
+        scope = COALESCE(?, scope),
+        security_mode = COALESCE(?, security_mode),
+        ask_mode = COALESCE(?, ask_mode),
+        ask_fallback = COALESCE(?, ask_fallback),
+        auto_allow_clis = COALESCE(?, auto_allow_clis)
+      WHERE id = 1
+    `).run(targetHost ?? null, scope ?? null, securityMode ?? null, askMode ?? null, askFallback ?? null, autoAllowCLIs !== undefined ? (autoAllowCLIs ? 1 : 0) : null);
+    res.json({ success: true, execConfig: getExecConfig() });
   });
 
   app.post("/api/nodes/config/binding", (req, res) => {
-    nodeBinding = { ...nodeBinding, ...req.body };
-    res.json({ success: true, nodeBinding });
+    const { defaultBinding, agentBindings } = req.body;
+    if (defaultBinding) {
+      db.prepare("UPDATE node_binding SET default_binding = ? WHERE id = 1").run(defaultBinding);
+    }
+    if (agentBindings) {
+      db.prepare("UPDATE node_binding SET agent_bindings = ? WHERE id = 1").run(JSON.stringify(agentBindings));
+    }
+    res.json({ success: true, nodeBinding: getNodeBinding() });
   });
 
   app.get("/api/nodes/devices", (req, res) => {
-    res.json({ devices });
+    res.json({ devices: getDevicesFromDb() });
+  });
+
+  app.post("/api/nodes/devices", (req, res) => {
+    const { name, description, roles, scopes } = req.body;
+    if (!name) return res.status(400).json({ error: "Name is required" });
+
+    const id = crypto.randomBytes(32).toString("hex");
+    const deviceRoles = roles || ["operator"];
+    const deviceScopes = scopes || ["operator.admin", "operator.approvals", "operator.pairing"];
+
+    db.prepare("INSERT INTO devices (id, name, description, roles, scopes) VALUES (?, ?, ?, ?, ?)")
+      .run(id, name, description || name, JSON.stringify(deviceRoles), JSON.stringify(deviceScopes));
+
+    db.prepare("INSERT INTO device_tokens (device_id, name, status, scopes) VALUES (?, ?, ?, ?)")
+      .run(id, "operator", "active", JSON.stringify(deviceScopes));
+
+    const devices = getDevicesFromDb();
+    const device = devices.find(d => d.id === id);
+    res.json({ success: true, device });
+  });
+
+  app.delete("/api/nodes/devices/:id", (req, res) => {
+    const { id } = req.params;
+    const existing = db.prepare("SELECT id FROM devices WHERE id = ?").get(id);
+    if (!existing) return res.status(404).json({ error: "Device not found" });
+
+    db.prepare("DELETE FROM device_tokens WHERE device_id = ?").run(id);
+    db.prepare("DELETE FROM devices WHERE id = ?").run(id);
+    res.json({ success: true });
   });
 
   app.post("/api/nodes/devices/:id/rotate", (req, res) => {
     const { id } = req.params;
+    const existing = db.prepare("SELECT id FROM devices WHERE id = ?").get(id);
+    if (!existing) return res.status(404).json({ error: "Device not found" });
+
+    db.prepare("UPDATE device_tokens SET created_at = datetime('now') WHERE device_id = ?").run(id);
+
+    const devices = getDevicesFromDb();
     const device = devices.find(d => d.id === id);
-    if (device) {
-      // Mock rotation
-      device.tokens.forEach(t => t.age = "Just now");
-      res.json({ success: true, device });
-    } else {
-      res.status(404).json({ error: "Device not found" });
-    }
+    res.json({ success: true, device });
   });
 
   app.post("/api/nodes/devices/:id/revoke", (req, res) => {
     const { id } = req.params;
+    const existing = db.prepare("SELECT id FROM devices WHERE id = ?").get(id);
+    if (!existing) return res.status(404).json({ error: "Device not found" });
+
+    db.prepare("DELETE FROM device_tokens WHERE device_id = ?").run(id);
+
+    const devices = getDevicesFromDb();
     const device = devices.find(d => d.id === id);
-    if (device) {
-      // Mock revocation
-      device.tokens = [];
-      res.json({ success: true, device });
-    } else {
-      res.status(404).json({ error: "Device not found" });
-    }
+    res.json({ success: true, device });
   });
 
   // --- Cron Job Endpoints ---
@@ -477,92 +556,31 @@ async function startServer() {
         }
         
         try {
-          // Try both variable names as the platform might inject either
-          const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+          const apiKey = process.env.OPENAI_API_KEY;
           
           if (!apiKey) {
-            console.error("API Key missing. GEMINI_API_KEY:", !!process.env.GEMINI_API_KEY, "API_KEY:", !!process.env.API_KEY);
-            return ctx.reply("Error: Gemini API Key is not configured on the server.");
+            return ctx.reply("Error: OpenAI API Key is not configured on the server.");
           }
 
-          const ai = new GoogleGenAI({ apiKey });
+          const openai = new OpenAI({ apiKey });
           
-          // Configure Tools based on enabled skills
-          const tools: any[] = [];
           let systemInstruction = "You are a helpful AI assistant.";
-
-          if (skills['google_search'].enabled) {
-            tools.push(skills['google_search'].config);
-          }
-          if (skills['weather_tool'].enabled) {
-            tools.push(skills['weather_tool'].config);
-          }
           if (skills['concise_mode'].enabled) {
             systemInstruction = skills['concise_mode'].config.systemInstruction;
           }
 
-          const modelConfig: any = {
-            model: "gemini-3-flash-preview",
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: userMessage }]
-              }
+          const response = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+              { role: "system", content: systemInstruction },
+              { role: "user", content: userMessage }
             ],
-            config: {
-              systemInstruction
-            }
-          };
+          });
 
-          if (tools.length > 0) {
-            modelConfig.config.tools = tools;
-          }
-
-          const response = await ai.models.generateContent(modelConfig);
-
-          // Handle Function Calls
-          const functionCalls = response.functionCalls;
-          if (functionCalls && functionCalls.length > 0) {
-             const call = functionCalls[0];
-             if (call.name === "get_weather") {
-                const location = (call.args as any).location;
-                // Mock Weather Data
-                const weatherData = {
-                  location: location,
-                  temperature: "72°F",
-                  condition: "Sunny",
-                  humidity: "45%"
-                };
-                
-                // Send function response back to model
-                const functionResponse = await ai.models.generateContent({
-                  model: "gemini-3-flash-preview",
-                  contents: [
-                    { role: "user", parts: [{ text: userMessage }] },
-                    { role: "model", parts: response.candidates![0].content.parts },
-                    { 
-                      role: "function", 
-                      parts: [{
-                        functionResponse: {
-                          name: "get_weather",
-                          response: { name: "get_weather", content: weatherData }
-                        }
-                      }]
-                    }
-                  ],
-                  config: { systemInstruction }
-                });
-                
-                await ctx.reply(functionResponse.text || "Here is the weather info.");
-                return;
-             }
-          }
-
-          const replyText = response.text || "I'm sorry, I couldn't generate a response.";
+          const replyText = response.choices[0]?.message?.content || "I'm sorry, I couldn't generate a response.";
           await ctx.reply(replyText);
         } catch (error: any) {
-          console.error("Error generating Gemini response for Telegram:", error);
-          // Send more detailed error to Telegram for debugging
+          console.error("Error generating OpenAI response for Telegram:", error);
           await ctx.reply(`I encountered an error: ${error.message || "Unknown error"}`);
         }
       });
@@ -587,6 +605,37 @@ async function startServer() {
     } catch (error: any) {
       console.error("Error starting bot:", error);
       res.status(500).json({ error: "Failed to start bot", details: error.message });
+    }
+  });
+
+  app.post("/api/chat", async (req, res) => {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: "Message is required" });
+
+    try {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) return res.status(500).json({ error: "OpenAI API Key is not configured." });
+
+      const openai = new OpenAI({ apiKey });
+
+      let systemInstruction = "You are a helpful AI assistant.";
+      if (skills['concise_mode'].enabled) {
+        systemInstruction = skills['concise_mode'].config.systemInstruction;
+      }
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: message }
+        ],
+      });
+
+      const reply = response.choices[0]?.message?.content || "I'm sorry, I couldn't generate a response.";
+      res.json({ reply });
+    } catch (error: any) {
+      console.error("Chat API error:", error);
+      res.status(500).json({ error: error.message || "Failed to generate response" });
     }
   });
 
